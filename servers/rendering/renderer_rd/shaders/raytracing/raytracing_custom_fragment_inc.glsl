@@ -41,7 +41,8 @@ global_time = scene_data_block.data.time;
 mat4 rt_world_to_object_decomp = rt_aabb_xform * mat4(gl_WorldToObjectEXT);
 
 vertex = (rt_world_to_object_decomp * vec4(rt_hit_pos, 1.0)).xyz;
-normal = mat3(rt_world_to_object_decomp) * rt_normal;
+// Unflipped normal for vertex code, as in raster.
+normal = mat3(rt_world_to_object_decomp) * (rt_front_face ? rt_normal : -rt_normal);
 tangent = mat3(rt_world_to_object_decomp) * rt_tangent;
 binormal = mat3(rt_world_to_object_decomp) * rt_bitangent;
 uv_interp = rt_uv;
@@ -59,6 +60,10 @@ rt_frag_coord = vec4(gl_LaunchIDEXT.xy, 0.0, 1.0);
 mat4 rt_modelview = rt_view_matrix * read_model_matrix;
 vertex = (rt_modelview * vec4(vertex, 1.0)).xyz;
 normal = normalize(mat3(rt_modelview) * normal);
+// Flipped on back faces, as in raster.
+if (!rt_front_face) {
+	normal = -normal;
+}
 tangent = normalize(mat3(rt_modelview) * tangent);
 binormal = normalize(mat3(rt_modelview) * binormal);
 
