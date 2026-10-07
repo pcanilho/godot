@@ -555,6 +555,16 @@ void main() {
 	if (alpha_scissor_threshold > 0.0 && alpha < alpha_scissor_threshold) {
 		ignoreIntersectionEXT;
 	}
+	// Hashed alpha: the hit passes with probability 1 - alpha, redrawn per ray and frame.
+	if (alpha_scissor_threshold <= 0.0 && alpha < 1.0) {
+		uint h = pcg_hash(gl_LaunchIDEXT.x + gl_LaunchIDEXT.y * 65536u);
+		h = pcg_hash(h ^ floatBitsToUint(gl_HitTEXT));
+		h = pcg_hash(h ^ floatBitsToUint(scene_data_block.data.time) ^ floatBitsToUint(scene_data_block.data.taa_frame_count));
+		h = pcg_hash(h ^ floatBitsToUint(gl_WorldRayDirectionEXT.x + 3.0 * gl_WorldRayDirectionEXT.y));
+		if (alpha < float(h) / 4294967296.0) {
+			ignoreIntersectionEXT;
+		}
+	}
 #else
 	// HG0: Standard material alpha test.
 	vec2 uv = fetch_uv(geom, i0, i1, i2, bary);
