@@ -32,6 +32,7 @@
 
 #include "servers/rendering/renderer_rd/forward_clustered/render_forward_clustered.h"
 #include "servers/rendering/renderer_rd/forward_clustered/render_raytracing.h"
+#include "servers/rendering/renderer_rd/shaders/effects/transparency_composite.glsl.gen.h"
 
 namespace RendererSceneRenderImplementation {
 
@@ -46,6 +47,21 @@ class RenderForwardClusteredPT : public RenderForwardClustered {
 
 	bool _setup_rt();
 	void _age_out_motion_vectors(const RenderDataRD *p_render_data);
+
+	/* Transparency over the denoised frame */
+
+	// Ray Reconstruction takes the raster-lit transparent surfaces drawn into
+	// its input for noise its guides do not explain, and averages small ones,
+	// particles, away. Under it they are drawn into a layer of their own and
+	// laid over its output.
+	struct {
+		TransparencyCompositeShaderRD shader;
+		RID version;
+		RID pipeline;
+	} transparency_composite;
+
+	RID _transparency_layer_fb(RenderSceneBuffersRD *p_render_buffers);
+	void _composite_transparency(const RenderDataRD *p_render_data);
 
 protected:
 	virtual void _render_scene(RenderDataRD *p_render_data, const Color &p_default_bg_color) override;
