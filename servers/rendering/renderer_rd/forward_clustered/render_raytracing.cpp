@@ -60,6 +60,13 @@ void RenderRaytracing::initialize(RenderForwardClustered *p_owner) {
 		mm_merge_shader.version_shader[i] = mm_merge_shader.shader.version_get_shader(mm_merge_shader.version, i);
 		mm_merge_shader.pipeline[i] = RD::get_singleton()->compute_pipeline_create(mm_merge_shader.version_shader[i]);
 	}
+
+	Vector<String> decode_modes;
+	decode_modes.push_back("\n");
+	position_decode_shader.shader.initialize(decode_modes);
+	position_decode_shader.version = position_decode_shader.shader.version_create();
+	position_decode_shader.version_shader = position_decode_shader.shader.version_get_shader(position_decode_shader.version, 0);
+	position_decode_shader.pipeline = RD::get_singleton()->compute_pipeline_create(position_decode_shader.version_shader);
 }
 
 RenderRaytracing::~RenderRaytracing() {
@@ -85,6 +92,7 @@ RenderRaytracing::~RenderRaytracing() {
 	}
 
 	mm_merge_shader.shader.version_free(mm_merge_shader.version);
+	position_decode_shader.shader.version_free(position_decode_shader.version);
 }
 
 // ---------------------------------------------------------------------------
@@ -326,6 +334,9 @@ void RenderRaytracing::cleanup_caches() {
 			for (uint32_t j = 0; j < RT_CACHE_CHUNK_SIZE; j++) {
 				RTCacheEntry *entry = &surface_chunks[i][j];
 				if (entry->ptr) {
+					if (entry->ptr->decoded_positions.is_valid()) {
+						RD::get_singleton()->free_rid(entry->ptr->decoded_positions);
+					}
 					memdelete(entry->ptr);
 					entry->ptr = nullptr;
 				}
@@ -659,7 +670,14 @@ RTSurfaceData *RenderRaytracing::process_surface(
 
 	RTSurfaceData *surf_data = entry->ptr;
 
-	_populate_surface_blas(p_mesh_surface, RID(), false, false, false, cache_key, surf_data, r_dirty_blas_list);
+	// Freed after the BLAS: freeing it would also free a BLAS built from it.
+	if (surf_data->decoded_positions.is_valid()) {
+		RD::get_singleton()->free_rid(surf_data->decoded_positions);
+		surf_data->decoded_positions = RID();
+	}
+	surf_data->decoded_positions = _queue_position_decode(p_mesh_surface, cache_key);
+
+	_populate_surface_blas(p_mesh_surface, RID(), false, false, false, cache_key, surf_data, r_dirty_blas_list, surf_data->decoded_positions);
 
 	surf->cached_final_transform_valid = false;
 
@@ -976,7 +994,8 @@ void RenderRaytracing::_populate_surface_blas(
 		bool p_allow_update,
 		uint32_t p_cache_key,
 		RTSurfaceData *r_surf_data,
-		LocalVector<RID> &r_dirty_blas_list) {
+		LocalVector<RID> &r_dirty_blas_list,
+		RID p_blas_positions) {
 	RID vertex_buffer, attribute_buffer, index_buffer;
 	_fill_surface_geometry_data(p_mesh_surface, p_force_uncompressed, r_surf_data,
 			&vertex_buffer, &attribute_buffer, &index_buffer);
@@ -1001,6 +1020,20 @@ void RenderRaytracing::_populate_surface_blas(
 	uint32_t vertex_count = geom.vertex_count;
 	uint32_t index_count = (geom.index_format != RT_INDEX_FORMAT_NONE) ? geom.primitive_count * 3 : 0;
 	uint32_t position_stride = geom.position_stride;
+	RID blas_vertex_buffer = vertex_buffer;
+
+	if (p_blas_positions.is_valid()) {
+		// The BLAS is built from positions in mesh units (_queue_position_decode),
+		// so neither the instance transform nor the hit shader
+		// (get_aabb_compression_xforms) applies the AABB. The hit shader still
+		// reads the mesh's own compressed normals and attributes.
+		r_surf_data->is_compressed = false;
+		r_surf_data->aabb_transform = Transform3D();
+		geom.aabb_size_x = geom.aabb_size_y = geom.aabb_size_z = 1.0f;
+		geom.aabb_pos_x = geom.aabb_pos_y = geom.aabb_pos_z = 0.0f;
+		blas_vertex_buffer = p_blas_positions;
+		position_stride = sizeof(float) * 3;
+	}
 
 	bool is_2d = RendererRD::MeshStorage::get_singleton()->mesh_surface_get_format(p_mesh_surface) & RSE::ARRAY_FLAG_USE_2D_VERTICES;
 	bool compressed = r_surf_data->is_compressed;
@@ -1019,7 +1052,7 @@ void RenderRaytracing::_populate_surface_blas(
 		RD::AccelerationStructureGeometry as_geom;
 		// Type defaults to TYPE_TRIANGLES; set explicitly for clarity.
 		as_geom.type = RD::AccelerationStructureGeometry::TYPE_TRIANGLES;
-		as_geom.geometry.triangles.vertex_buffer = vertex_buffer;
+		as_geom.geometry.triangles.vertex_buffer = blas_vertex_buffer;
 		as_geom.geometry.triangles.vertex_stride = position_stride;
 		as_geom.geometry.triangles.vertex_count = vertex_count;
 		as_geom.geometry.triangles.vertex_format = pos_format;
@@ -1044,6 +1077,87 @@ void RenderRaytracing::_populate_surface_blas(
 				String(p_vertex_buffer_override.is_valid() ? "RT BLAS deformed [" : "RT BLAS [") + itos(p_cache_key) + "]");
 		r_dirty_blas_list.push_back(r_surf_data->blas);
 	}
+}
+
+// A compressed surface's positions are 16-bit fractions of its AABB, and its
+// BLAS is built from them in the unit cube, scaled back out by the AABB in the
+// instance transform. A flat surface's AABB is 0.00001 thick on one axis (the
+// least the mesh storage gives an axis), so its instance is scaled 100,000
+// times less on that axis than on the others, and ray traversal near it
+// breaks down: a flat 318 by 256 m lake took 95 to 230 ms of a traced frame
+// that took 10 without it, and the same lake in a box 1 mm thick took no more
+// than none. Such a surface's BLAS is built from its positions decoded to mesh
+// units instead; the decoded copy costs 12 bytes a vertex, so surfaces with a
+// real thickness keep the compressed path.
+static constexpr float RT_FLAT_AABB_RATIO = 0.001f;
+
+RID RenderRaytracing::_queue_position_decode(void *p_mesh_surface, uint32_t p_cache_key) {
+	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
+
+	uint64_t format = mesh_storage->mesh_surface_get_format(p_mesh_surface);
+	if (!(format & RSE::ARRAY_FLAG_COMPRESS_ATTRIBUTES) || (format & RSE::ARRAY_FLAG_USE_2D_VERTICES)) {
+		return RID();
+	}
+	AABB aabb = mesh_storage->mesh_surface_get_aabb(p_mesh_surface);
+	if (aabb.get_shortest_axis_size() >= aabb.get_longest_axis_size() * RT_FLAT_AABB_RATIO) {
+		return RID();
+	}
+	uint32_t vertex_count = mesh_storage->mesh_surface_get_vertex_count(p_mesh_surface);
+	RID src = mesh_storage->mesh_surface_get_vertex_buffer(p_mesh_surface);
+	if (vertex_count == 0 || !src.is_valid()) {
+		return RID();
+	}
+
+	RD *rd = RD::get_singleton();
+	BitField<RD::BufferCreationBits> flags =
+			RD::BUFFER_CREATION_AS_STORAGE_BIT |
+			RD::BUFFER_CREATION_DEVICE_ADDRESS_BIT |
+			RD::BUFFER_CREATION_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT;
+	RID dst = rd->vertex_buffer_create(vertex_count * sizeof(float) * 3, {}, flags);
+	ERR_FAIL_COND_V(!dst.is_valid(), RID());
+	rd->set_resource_name(dst, "RT BLAS decoded positions [" + itos(p_cache_key) + "]");
+
+	PendingPositionDecode decode;
+	decode.src_vertex_buffer = src;
+	decode.dst_buffer = dst;
+	decode.vertex_count = vertex_count;
+	decode.aabb = aabb;
+	pending_position_decodes.push_back(decode);
+	return dst;
+}
+
+void RenderRaytracing::_dispatch_position_decodes(RD::ComputeListID p_compute_list) {
+	RD *rd = RD::get_singleton();
+	for (const PendingPositionDecode &decode : pending_position_decodes) {
+		RD::Uniform u;
+		u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+		u.binding = 0;
+		u.append_id(decode.dst_buffer);
+		RID uniform_set = rd->uniform_set_create({ &u, 1 }, position_decode_shader.version_shader, 0, /*p_linear_pool=*/true);
+		ERR_CONTINUE(!uniform_set.is_valid());
+
+		struct DecodePC {
+			uint32_t src_vtx_lo, src_vtx_hi;
+			uint32_t vertex_count, pad;
+			float aabb_position[4];
+			float aabb_size[4];
+		} pc = {};
+		uint64_t src_bda = rd->buffer_get_device_address(decode.src_vertex_buffer);
+		pc.src_vtx_lo = uint32_t(src_bda);
+		pc.src_vtx_hi = uint32_t(src_bda >> 32);
+		pc.vertex_count = decode.vertex_count;
+		for (int i = 0; i < 3; i++) {
+			pc.aabb_position[i] = decode.aabb.position[i];
+			pc.aabb_size[i] = decode.aabb.size[i];
+		}
+
+		rd->compute_list_bind_compute_pipeline(p_compute_list, position_decode_shader.pipeline);
+		rd->compute_list_bind_uniform_set(p_compute_list, uniform_set, 0);
+		rd->compute_list_set_push_constant(p_compute_list, &pc, sizeof(DecodePC));
+		rd->compute_list_dispatch_threads(p_compute_list, decode.vertex_count, 1, 1);
+		rd->free_rid(uniform_set);
+	}
+	pending_position_decodes.clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -2754,6 +2868,9 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 #endif
 
 	SceneShaderRaytracing::get_singleton()->finalize_custom_shaders();
+
+	// After every process_surface above, before the BLAS builds read them.
+	_dispatch_position_decodes(compute_list);
 
 	RD::get_singleton()->compute_list_end();
 

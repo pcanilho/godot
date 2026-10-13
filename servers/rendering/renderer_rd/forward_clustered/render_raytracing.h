@@ -38,6 +38,7 @@
 #include "core/templates/vector.h"
 #include "servers/rendering/renderer_rd/bindless_block.h"
 #include "servers/rendering/renderer_rd/shaders/raytracing/multimesh_merge.glsl.gen.h"
+#include "servers/rendering/renderer_rd/shaders/raytracing/position_decode.glsl.gen.h"
 #include "servers/rendering/rendering_device.h"
 
 #define RB_TEX_RAYTRACING SNAME("raytracing")
@@ -194,6 +195,9 @@ struct RTSurfaceData {
 	Transform3D aabb_transform;
 	bool is_compressed = false;
 	uint64_t blas_size = 0;
+	// Float3 positions in mesh units the BLAS is built from, for a flat
+	// compressed surface (RenderRaytracing::_queue_position_decode).
+	RID decoded_positions;
 };
 
 /// Inputs for a surface backed by a per-frame-deformed vertex buffer.
@@ -348,6 +352,22 @@ class RenderRaytracing {
 		RID pipeline[MODE_MAX];
 	} mm_merge_shader;
 
+	// Flat compressed surfaces' positions decoded for their BLAS.
+	struct PositionDecodeShader {
+		PositionDecodeShaderRD shader;
+		RID version;
+		RID version_shader;
+		RID pipeline;
+	} position_decode_shader;
+
+	struct PendingPositionDecode {
+		RID src_vertex_buffer;
+		RID dst_buffer;
+		uint32_t vertex_count = 0;
+		AABB aabb;
+	};
+	LocalVector<PendingPositionDecode> pending_position_decodes;
+
 	struct MMSurfaceHandles {
 		LocalVector<RID> per_surface; // Grown on demand; entry per touched surface index.
 		uint32_t mm_validator = 0; // High 32 bits of MM RID id at last access.
@@ -436,7 +456,10 @@ class RenderRaytracing {
 			bool p_allow_update,
 			uint32_t p_cache_key,
 			RTSurfaceData *r_surf_data,
-			LocalVector<RID> &r_dirty_blas_list);
+			LocalVector<RID> &r_dirty_blas_list,
+			RID p_blas_positions = RID());
+	RID _queue_position_decode(void *p_mesh_surface, uint32_t p_cache_key);
+	void _dispatch_position_decodes(RD::ComputeListID p_compute_list);
 	RTMaterialData *process_material(RID p_material_rid, uint16_t p_material_invalidation_counter);
 	bool _build_merged_mm_blas(
 			RID p_mm_rid,
