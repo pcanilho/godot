@@ -77,6 +77,9 @@ public:
 
 	virtual void set_rt_procedural(bool p_procedural, const AABB &p_aabb) {}
 	virtual void set_rt_procedural_bounds(const Vector<float> &p_aabb_data, bool p_expose_bounds) {}
+	// A shadow-only instance reaches the path tracer only on the shadow caster
+	// layers, and then as a caster that shadow rays alone meet.
+	virtual void set_rt_shadows_only(bool p_enable) {}
 };
 
 // Base implementation of RenderGeometryInstance shared by internal renderers.

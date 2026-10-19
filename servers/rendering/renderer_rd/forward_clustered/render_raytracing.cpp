@@ -625,7 +625,8 @@ RTSurfaceData *RenderRaytracing::process_surface(
 		void *p_mesh_surface,
 		uint32_t p_surface_invalidation_counter,
 		const Transform3D &p_transform,
-		LocalVector<RID> &r_dirty_blas_list) {
+		LocalVector<RID> &r_dirty_blas_list,
+		bool p_shadow_caster) {
 	const RenderForwardClustered::GeometryInstanceSurfaceDataCache *surf =
 			static_cast<const RenderForwardClustered::GeometryInstanceSurfaceDataCache *>(p_surf);
 
@@ -644,9 +645,12 @@ RTSurfaceData *RenderRaytracing::process_surface(
 	RTCacheEntry *entry = get_surface_cache_entry(cache_key);
 
 	uint32_t current_frame = RSG::rasterizer->get_frame_number();
+	// A mesh a caster uses keeps its no-duplicate BLAS for every instance of it:
+	// rebuilding per user would thrash the cache for a mesh shared both ways.
 	bool needs_refresh = !entry->ptr ||
 			entry->cached_rid_version != mesh_version ||
-			entry->cached_counter != p_surface_invalidation_counter;
+			entry->cached_counter != p_surface_invalidation_counter ||
+			(p_shadow_caster && !entry->ptr->no_duplicate_any_hit);
 
 	if (!needs_refresh && entry->ptr->blas.is_valid()) {
 		cache_hits++;
@@ -677,7 +681,11 @@ RTSurfaceData *RenderRaytracing::process_surface(
 	}
 	surf_data->decoded_positions = _queue_position_decode(p_mesh_surface, cache_key);
 
-	_populate_surface_blas(p_mesh_surface, RID(), false, false, false, cache_key, surf_data, r_dirty_blas_list, surf_data->decoded_positions);
+	if (entry->cached_rid_version != mesh_version) {
+		surf_data->no_duplicate_any_hit = false;
+	}
+	surf_data->no_duplicate_any_hit = surf_data->no_duplicate_any_hit || p_shadow_caster;
+	_populate_surface_blas(p_mesh_surface, RID(), false, false, false, cache_key, surf_data, r_dirty_blas_list, surf_data->decoded_positions, surf_data->no_duplicate_any_hit);
 
 	surf->cached_final_transform_valid = false;
 
@@ -995,7 +1003,8 @@ void RenderRaytracing::_populate_surface_blas(
 		uint32_t p_cache_key,
 		RTSurfaceData *r_surf_data,
 		LocalVector<RID> &r_dirty_blas_list,
-		RID p_blas_positions) {
+		RID p_blas_positions,
+		bool p_no_duplicate_any_hit) {
 	RID vertex_buffer, attribute_buffer, index_buffer;
 	_fill_surface_geometry_data(p_mesh_surface, p_force_uncompressed, r_surf_data,
 			&vertex_buffer, &attribute_buffer, &index_buffer);
@@ -1060,6 +1069,9 @@ void RenderRaytracing::_populate_surface_blas(
 		if (index_buffer.is_valid() && index_count > 0) {
 			as_geom.geometry.triangles.index_buffer = index_buffer;
 			as_geom.geometry.triangles.index_count = index_count;
+		}
+		if (p_no_duplicate_any_hit) {
+			as_geom.flags.set_flag(RD::ACCELERATION_STRUCTURE_GEOMETRY_NO_DUPLICATE_ANY_HIT_INVOCATION_BIT);
 		}
 
 		BitField<RD::AccelerationStructureFlagBits> as_flags = p_prefer_fast_build
@@ -2389,6 +2401,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 		Transform3D instance_transform;
 		Transform3D prev_instance_transform;
 		bool transform_moved;
+		bool shadow_caster;
 		RTMaterialData *mat_data;
 		uint32_t inst_flags;
 	};
@@ -2402,6 +2415,10 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 			continue;
 		}
 		const Transform3D &instance_transform = inst->transform;
+		// Scene cull lets a shadow-only instance through only on the caster layers.
+		const bool shadow_caster = inst->rt_shadows_only;
+		const uint8_t instance_mask = shadow_caster ? RT_INSTANCE_MASK_SHADOW_CASTER : RT_INSTANCE_MASK_SCENE;
+		const uint32_t caster_flag = shadow_caster ? RT_GEOM_FLAG_SHADOW_CASTER : 0u;
 
 		// Determine previous-frame transform for motion vectors.
 		const Transform3D &prev_instance_transform =
@@ -2451,7 +2468,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				sbt_offsets.push_back(hg_index);
 
 				RT_GeometryData geom = {};
-				geom.flags = RT_GEOM_FLAG_PROCEDURAL;
+				geom.flags = RT_GEOM_FLAG_PROCEDURAL | caster_flag;
 				geom.vertex_buffer_address = ps->gpu_buffer_address;
 				geom.aabb_size_x = (float)ps->culling_aabb.size.x;
 				geom.aabb_size_y = (float)ps->culling_aabb.size.y;
@@ -2476,7 +2493,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				uint32_t inst_flags = RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT |
 						RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT;
 				instance_flags.push_back(inst_flags);
-				instance_masks.push_back(0xFF);
+				instance_masks.push_back(instance_mask);
 			}
 			continue;
 		}
@@ -2576,6 +2593,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				pending.instance_transform = instance_transform;
 				pending.prev_instance_transform = prev_instance_transform;
 				pending.transform_moved = transform_moved;
+				pending.shadow_caster = shadow_caster;
 				pending.mat_data = mat_data;
 				pending.inst_flags = inst_flags;
 				pending_mm_surfaces.push_back(pending);
@@ -2621,7 +2639,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				}
 			}
 			if (!surf_data) {
-				surf_data = process_surface(surf, mesh_surface, surface_counter, instance_transform, dirty_blas_list);
+				surf_data = process_surface(surf, mesh_surface, surface_counter, instance_transform, dirty_blas_list, shadow_caster);
 			}
 			if (!surf_data || !surf_data->blas.is_valid()) {
 				surf = surf->next;
@@ -2667,6 +2685,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 
 			blass.push_back(surf_data->blas);
 			geometry_data.push_back(surf_data->geometry);
+			geometry_data[geometry_data.size() - 1].flags |= caster_flag;
 
 			if (inst->transform_status == RenderForwardClustered::GeometryInstanceForwardClustered::TransformStatus::MOVED) {
 				motion_indices.push_back((int32_t)motion_transforms.size());
@@ -2733,7 +2752,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				}
 			}
 			instance_flags.push_back(inst_flags);
-			instance_masks.push_back(0xFF);
+			instance_masks.push_back(instance_mask);
 
 			surf = surf->next;
 		}
@@ -2750,7 +2769,9 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 		uint32_t mm_pre_refit_size = dirty_blas_update_list.size();
 #endif
 		RTSurfaceData merged_sd;
-		bool use_merged = pending.mm_gpu_buffer.is_valid() &&
+		// A caster's MultiMesh takes the expanded path, whose shared BLAS is
+		// built without duplicate any-hit calls.
+		bool use_merged = !pending.shadow_caster && pending.mm_gpu_buffer.is_valid() &&
 				_build_merged_mm_blas(pending.mm_rid, pending.mm_gpu_buffer, pending.mesh_surface,
 						pending.mm_count, pending.surface_index, pending.surface_counter,
 						compute_list, dirty_blas_list, dirty_blas_update_list, &merged_sd);
@@ -2763,7 +2784,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 			material_data.push_back(pending.mat_data->data);
 			motion_indices.push_back(-1);
 			instance_flags.push_back(pending.inst_flags);
-			instance_masks.push_back(0xFF);
+			instance_masks.push_back(RT_INSTANCE_MASK_SCENE);
 #ifdef TOOLS_ENABLED
 			if (collect_render_info) {
 				tlas_instance_count++;
@@ -2788,7 +2809,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 			const uint32_t mm_cur_offset = mesh_storage->multimesh_get_current_instance_offset(pending.mm_rid);
 
 			RTSurfaceData *surf_data = process_surface(pending.mm_surf, pending.mesh_surface,
-					pending.surface_counter, pending.instance_transform, dirty_blas_list);
+					pending.surface_counter, pending.instance_transform, dirty_blas_list, pending.shadow_caster);
 			if (!surf_data || !surf_data->blas.is_valid()) {
 				continue;
 			}
@@ -2817,6 +2838,9 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				blass.push_back(surf_data->blas);
 				blas_transforms.push_back(final_transform);
 				geometry_data.push_back(surf_data->geometry);
+				if (pending.shadow_caster) {
+					geometry_data[geometry_data.size() - 1].flags |= RT_GEOM_FLAG_SHADOW_CASTER;
+				}
 				sbt_offsets.push_back(pending.mat_data->rt_sbt_offset);
 				material_data.push_back(pending.mat_data->data);
 
@@ -2834,7 +2858,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				}
 
 				instance_flags.push_back(pending.inst_flags);
-				instance_masks.push_back(0xFF);
+				instance_masks.push_back(pending.shadow_caster ? RT_INSTANCE_MASK_SHADOW_CASTER : RT_INSTANCE_MASK_SCENE);
 			}
 
 #ifdef TOOLS_ENABLED

@@ -1143,6 +1143,8 @@ public:
 		// Raytracing: wider AABB cull volume for TLAS and light gathering.
 		bool rt_enabled = false;
 		AABB rt_aabb;
+		// Shadow-only instances on these layers are traced as shadow casters.
+		uint32_t rt_shadow_caster_layers = 0;
 	} cull;
 
 	struct VisibilityCullData {

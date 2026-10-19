@@ -501,7 +501,7 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 
 			rayQueryEXT spec_rq;
 			rayQueryInitializeEXT(spec_rq, tlas, RT_RAY_FLAGS | gl_RayFlagsTerminateOnFirstHitEXT,
-					0xFF, spec_origin, 0.001, spec_dir, 10000.0);
+					RT_MASK_SCENE, spec_origin, 0.001, spec_dir, 10000.0);
 			while (rayQueryProceedEXT(spec_rq)) {
 				if (rayQueryGetIntersectionTypeEXT(spec_rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {
 					if (ray_query_alpha_test(

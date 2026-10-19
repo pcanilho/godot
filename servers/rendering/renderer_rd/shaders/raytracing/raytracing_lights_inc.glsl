@@ -185,16 +185,19 @@ bool ray_query_alpha_test(uint geometry_idx, uint primitive_id, vec2 candidate_b
 // Shadow Ray (traceRayEXT pipeline)
 // ============================================================================
 
-/// Returns true if light is visible.
+/// How much of the light arrives, 0 to 1: 0 behind an opaque hit, otherwise
+/// the product of 1 - alpha over the shadow casters the ray passes, which
+/// their any-hit keeps in the payload's hit_t.
 /// Uses SkipClosestHitShader so only any_hit (alpha test) and miss are invoked.
 /// TerminateOnFirstHit causes early exit on first confirmed opaque hit.
-bool lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist, inout uint rng_state) {
+float lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist, inout uint rng_state) {
 #ifdef USE_RAY_QUERY_SHADOWS
-	// Ray queries are significantly faster, but can not handle complex alpha materials
+	// Ray queries are significantly faster, but can not handle complex alpha materials.
+	// They run no any-hit, so casters, whose alpha is their shader's, are left out.
 	rayQueryEXT shadow_rq;
 	rayQueryInitializeEXT(shadow_rq, tlas,
 			gl_RayFlagsTerminateOnFirstHitEXT,
-			0xFF, origin, 0.001, direction, max_dist - 0.001);
+			RT_MASK_SCENE, origin, 0.001, direction, max_dist - 0.001);
 
 	while (rayQueryProceedEXT(shadow_rq)) {
 		if (rayQueryGetIntersectionTypeEXT(shadow_rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {
@@ -209,19 +212,10 @@ bool lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist, inout 
 		}
 	}
 
-	return rayQueryGetIntersectionTypeEXT(shadow_rq, true) == gl_RayQueryCommittedIntersectionNoneEXT;
-#elif defined(USE_SER)
-	hitObjectEXT hitObject;
-	hitObjectTraceRayEXT(hitObject, tlas,
-			gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
-			0xFF, 0, 0, 0,
-			origin, 0.001, direction, max_dist - 0.001, 0);
-
-	return !(hitObjectIsHitEXT(hitObject));
+	return rayQueryGetIntersectionTypeEXT(shadow_rq, true) == gl_RayQueryCommittedIntersectionNoneEXT ? 1.0 : 0.0;
 #else
-	/// The miss shader writes radiance = vec3(1.0) for shadow rays (visible).
-	/// If an opaque hit occurs, miss is never called and radiance stays vec3(0.0).
-	// Save full payload, set up shadow ray, then restore after trace.
+	// Save full payload, set up shadow ray, then restore after trace. The
+	// transmittance starts at 1 in hit_t, which a shadow ray does not use.
 	PathPayload saved_payload = payload;
 
 	PathState shadow_ps;
@@ -229,23 +223,32 @@ bool lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist, inout 
 	shadow_ps.throughput = vec3(0.0);
 	shadow_ps.packed_bounces_flags = set_shadow_ray(0u);
 	shadow_ps.rng_state = 0u;
-	shadow_ps.hit_t = 0.0;
+	shadow_ps.hit_t = 1.0;
 	shadow_ps.offset_normal = vec3(0.0, 0.0, 1.0);
 	shadow_ps.next_ray_dir = vec3(0.0, 0.0, 1.0);
 	path_pack(payload, shadow_ps);
 
+#if defined(USE_SER)
+	hitObjectEXT hitObject;
+	hitObjectTraceRayEXT(hitObject, tlas,
+			gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
+			RT_MASK_SHADOW, 0, 0, 0,
+			origin, 0.001, direction, max_dist - 0.001, 0);
+	bool visible = !hitObjectIsHitEXT(hitObject);
+#else
+	/// The miss shader writes radiance = vec3(1.0) for shadow rays (visible).
+	/// If an opaque hit occurs, miss is never called and radiance stays vec3(0.0).
 	traceRayEXT(tlas,
 			gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
-			0xFF, 0, 0, 0,
+			RT_MASK_SHADOW, 0, 0, 0,
 			origin, 0.001, direction, max_dist - 0.001, 0);
-
-	// Unpack to check visibility (miss shader packs radiance = 1.0).
-	shadow_ps = path_unpack(payload);
-	bool visible = shadow_ps.radiance.x > 0.5;
+	bool visible = path_unpack(payload).radiance.x > 0.5;
+#endif
+	float transmittance = payload.hit_t;
 
 	payload = saved_payload;
 
-	return visible;
+	return visible ? clamp(transmittance, 0.0, 1.0) : 0.0;
 #endif
 }
 
@@ -345,7 +348,8 @@ vec3 lights_evaluate_direct_lighting(
 			spot_atten = 1.0 - pow(spot_rim, light.inv_spot_attenuation);
 		}
 
-		if (!lights_trace_shadow_ray(hit_pos, L, shadow_dist, rng_state)) {
+		float visibility = lights_trace_shadow_ray(hit_pos, L, shadow_dist, rng_state);
+		if (visibility <= 0.0) {
 			return vec3(0.0);
 		}
 
@@ -364,7 +368,7 @@ vec3 lights_evaluate_direct_lighting(
 		float indirect_mul = is_indirect_bounce ? light.indirect_energy : 1.0;
 
 		// NdotL is already included in brdf_value (evalLambertian/evalMicrofacet bake it in).
-		vec3 contribution = brdf_value * light.emission * atten * indirect_mul;
+		vec3 contribution = brdf_value * light.emission * atten * indirect_mul * visibility;
 		return contribution / max(light_select_pdf, 1e-10);
 	}
 	// === CONE LIGHT PATH (directional) ===
@@ -378,7 +382,8 @@ vec3 lights_evaluate_direct_lighting(
 			return vec3(0.0);
 		}
 
-		if (!lights_trace_shadow_ray(hit_pos, L, ls.max_distance, rng_state)) {
+		float visibility = lights_trace_shadow_ray(hit_pos, L, ls.max_distance, rng_state);
+		if (visibility <= 0.0) {
 			return vec3(0.0);
 		}
 
@@ -390,6 +395,6 @@ vec3 lights_evaluate_direct_lighting(
 
 		float indirect_mul = is_indirect_bounce ? light.indirect_energy : 1.0;
 
-		return brdf_value * light.emission * indirect_mul / max(light_select_pdf, 1e-10);
+		return brdf_value * light.emission * indirect_mul * visibility / max(light_select_pdf, 1e-10);
 	}
 }

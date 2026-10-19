@@ -174,6 +174,16 @@ enum {
 	RT_GEOM_FLAG_PROCEDURAL = 2u,
 	// Set when the BLAS uses a per-frame-deformed vertex buffer.
 	RT_GEOM_FLAG_DEFORMED = 4u,
+	// A shadow caster (rendering/pathtracing/shadow_caster_layers): its any-hit
+	// dims a shadow ray instead of stopping it.
+	RT_GEOM_FLAG_SHADOW_CASTER = 8u,
+};
+
+// Instance masks. Camera, bounce and specular rays cull with 0x01 (RT_MASK_SCENE
+// in raytracing_inc.glsl), so they never meet a caster; shadow rays with 0xFF.
+enum {
+	RT_INSTANCE_MASK_SCENE = 0xFFu,
+	RT_INSTANCE_MASK_SHADOW_CASTER = 0x02u,
 };
 
 /// Per-instance state for procedural RT geometry. Heap-allocated, only exists for procedural instances.
@@ -198,6 +208,9 @@ struct RTSurfaceData {
 	// Float3 positions in mesh units the BLAS is built from, for a flat
 	// compressed surface (RenderRaytracing::_queue_position_decode).
 	RID decoded_positions;
+	// Built with NO_DUPLICATE_ANY_HIT_INVOCATION: a caster's any-hit multiplies
+	// a transmittance, so a second call on the same triangle would darken it.
+	bool no_duplicate_any_hit = false;
 };
 
 /// Inputs for a surface backed by a per-frame-deformed vertex buffer.
@@ -441,7 +454,8 @@ class RenderRaytracing {
 			void *p_mesh_surface,
 			uint32_t p_surface_invalidation_counter,
 			const Transform3D &p_transform,
-			LocalVector<RID> &r_dirty_blas_list);
+			LocalVector<RID> &r_dirty_blas_list,
+			bool p_shadow_caster = false);
 	RTSurfaceData *process_deformed_surface(
 			const void *p_surf,
 			void *p_mesh_surface,
@@ -457,7 +471,8 @@ class RenderRaytracing {
 			uint32_t p_cache_key,
 			RTSurfaceData *r_surf_data,
 			LocalVector<RID> &r_dirty_blas_list,
-			RID p_blas_positions = RID());
+			RID p_blas_positions = RID(),
+			bool p_no_duplicate_any_hit = false);
 	RID _queue_position_decode(void *p_mesh_surface, uint32_t p_cache_key);
 	void _dispatch_position_decodes(RD::ComputeListID p_compute_list);
 	RTMaterialData *process_material(RID p_material_rid, uint16_t p_material_invalidation_counter);

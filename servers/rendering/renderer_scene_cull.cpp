@@ -739,6 +739,7 @@ void RendererSceneCull::instance_set_base(RID p_instance, RID p_base) {
 				geom->geometry_instance->set_use_lightmap(RID(), instance->lightmap_uv_scale, instance->lightmap_slice_index);
 				geom->geometry_instance->set_instance_shader_uniforms_offset(instance->instance_uniforms.location());
 				geom->geometry_instance->set_cast_double_sided_shadows(instance->cast_shadows == RSE::SHADOW_CASTING_SETTING_DOUBLE_SIDED);
+				geom->geometry_instance->set_rt_shadows_only(instance->cast_shadows == RSE::SHADOW_CASTING_SETTING_SHADOWS_ONLY);
 				if (instance->lightmap_sh.size() == 9) {
 					geom->geometry_instance->set_lightmap_capture(instance->lightmap_sh.ptr());
 				}
@@ -1368,6 +1369,7 @@ void RendererSceneCull::instance_geometry_set_cast_shadows_setting(RID p_instanc
 		ERR_FAIL_NULL(geom->geometry_instance);
 
 		geom->geometry_instance->set_cast_double_sided_shadows(instance->cast_shadows == RSE::SHADOW_CASTING_SETTING_DOUBLE_SIDED);
+		geom->geometry_instance->set_rt_shadows_only(instance->cast_shadows == RSE::SHADOW_CASTING_SETTING_SHADOWS_ONLY);
 	}
 
 	_instance_queue_update(instance, false, true);
@@ -3329,7 +3331,10 @@ void RendererSceneCull::_scene_cull(CullData &cull_data, InstanceCullResult &cul
 						if (base_type == RSE::INSTANCE_LIGHT) {
 							cull_result.rt_light_instances.push_back(RID::from_uint64(idata.instance_data_rid));
 						} else if ((base_type == RSE::INSTANCE_MESH || base_type == RSE::INSTANCE_MULTIMESH) &&
-								!(idata.flags & InstanceData::FLAG_CAST_SHADOWS_ONLY)) {
+								(!(idata.flags & InstanceData::FLAG_CAST_SHADOWS_ONLY) || (idata.layer_mask & cull_data.cull->rt_shadow_caster_layers))) {
+							// A shadow-only instance off the caster layers stays out: the
+							// tracer would cast its shadow twice where the instance it
+							// stands in for is traced too.
 							cull_result.rt_geometry_instances.push_back(idata.instance_geometry);
 							mesh_visible = true; // For skinned/deformed meshes..
 						}
@@ -3443,6 +3448,9 @@ void RendererSceneCull::_render_scene(const RendererSceneRender::CameraData *p_c
 		float z_far = p_camera_data->main_projection.get_z_far();
 		Vector3 cam_origin = p_camera_data->main_transform.origin;
 		cull.rt_aabb = AABB(cam_origin - Vector3(z_far, z_far, z_far), Vector3(z_far, z_far, z_far) * 2.0);
+		cull.rt_shadow_caster_layers = GLOBAL_GET_CACHED(uint32_t, "rendering/pathtracing/shadow_caster_layers");
+	} else {
+		cull.rt_shadow_caster_layers = 0;
 	}
 
 	Vector<RID> directional_lights;

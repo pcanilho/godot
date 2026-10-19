@@ -142,6 +142,17 @@ const uint FLAG_COMPRESSED = 1u;
 const uint FLAG_PROCEDURAL = 2u;
 // Set when the BLAS uses a per-frame-deformed vertex buffer.
 const uint FLAG_DEFORMED = 4u;
+// A shadow caster (rendering/pathtracing/shadow_caster_layers): on a shadow
+// ray its any-hit multiplies the ray's transmittance by 1 - alpha.
+const uint FLAG_SHADOW_CASTER = 8u;
+
+// Cull masks. Casters carry instance mask 0x02 and every other instance 0xFF,
+// so camera, bounce and specular rays (RT_MASK_SCENE) never meet a caster and
+// shadow rays (RT_MASK_SHADOW) meet both.
+#define RT_MASK_SCENE 0x01u
+#define RT_MASK_SHADOW 0xFFu
+// A shadow ray's transmittance under this is taken as blocked.
+#define RT_SHADOW_OPAQUE_TRANSMITTANCE (1.0 / 256.0)
 
 // ============================================================================
 // RANDOM NUMBER GENERATION - PCG (Permuted Congruential Generator)

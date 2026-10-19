@@ -68,7 +68,7 @@ void main() {
 
 #ifdef USE_SER
 			hitObjectEXT hitObject;
-			hitObjectTraceRayEXT(hitObject, tlas, RT_RAY_FLAGS, 0xFF, 0, 0, 0, ray_origin, 0.001, ray_dir, 10000.0, 0);
+			hitObjectTraceRayEXT(hitObject, tlas, RT_RAY_FLAGS, RT_MASK_SCENE, 0, 0, 0, ray_origin, 0.001, ray_dir, 10000.0, 0);
 
 			// Reorder with a coherence hint that has 8 bits
 			uint hint = 0;
@@ -80,7 +80,7 @@ void main() {
 
 			hitObjectExecuteShaderEXT(hitObject, 0);
 #else
-			traceRayEXT(tlas, RT_RAY_FLAGS, 0xFF, 0, 0, 0, ray_origin, 0.001, ray_dir, 10000.0, 0);
+			traceRayEXT(tlas, RT_RAY_FLAGS, RT_MASK_SCENE, 0, 0, 0, ray_origin, 0.001, ray_dir, 10000.0, 0);
 #endif
 
 			ps = path_unpack(payload);
@@ -552,17 +552,29 @@ void main() {
 
 #include "raytracing_custom_fragment_inc.glsl"
 
-	if (alpha_scissor_threshold > 0.0 && alpha < alpha_scissor_threshold) {
-		ignoreIntersectionEXT;
-	}
-	// Hashed alpha: the hit passes with probability 1 - alpha, redrawn per ray and frame.
-	if (alpha_scissor_threshold <= 0.0 && alpha < 1.0) {
-		uint h = pcg_hash(gl_LaunchIDEXT.x + gl_LaunchIDEXT.y * 65536u);
-		h = pcg_hash(h ^ floatBitsToUint(gl_HitTEXT));
-		h = pcg_hash(h ^ floatBitsToUint(scene_data_block.data.time) ^ floatBitsToUint(scene_data_block.data.taa_frame_count));
-		h = pcg_hash(h ^ floatBitsToUint(gl_WorldRayDirectionEXT.x + 3.0 * gl_WorldRayDirectionEXT.y));
-		if (alpha < float(h) / 4294967296.0) {
+	if ((geom.flags & FLAG_SHADOW_CASTER) != 0u) {
+		// Only shadow rays reach a caster (its instance mask). Its alpha dims the
+		// light, kept as the ray's transmittance in the payload's hit_t, and the
+		// ray goes on: a soft alpha casts a soft shadow with no noise. Once next
+		// to nothing is left, the hit stands and the light is blocked.
+		float caster_alpha = alpha_scissor_threshold > 0.0 ? step(alpha_scissor_threshold, alpha) : clamp(alpha, 0.0, 1.0);
+		payload.hit_t *= 1.0 - caster_alpha;
+		if (payload.hit_t > RT_SHADOW_OPAQUE_TRANSMITTANCE) {
 			ignoreIntersectionEXT;
+		}
+	} else {
+		if (alpha_scissor_threshold > 0.0 && alpha < alpha_scissor_threshold) {
+			ignoreIntersectionEXT;
+		}
+		// Hashed alpha: the hit passes with probability 1 - alpha, redrawn per ray and frame.
+		if (alpha_scissor_threshold <= 0.0 && alpha < 1.0) {
+			uint h = pcg_hash(gl_LaunchIDEXT.x + gl_LaunchIDEXT.y * 65536u);
+			h = pcg_hash(h ^ floatBitsToUint(gl_HitTEXT));
+			h = pcg_hash(h ^ floatBitsToUint(scene_data_block.data.time) ^ floatBitsToUint(scene_data_block.data.taa_frame_count));
+			h = pcg_hash(h ^ floatBitsToUint(gl_WorldRayDirectionEXT.x + 3.0 * gl_WorldRayDirectionEXT.y));
+			if (alpha < float(h) / 4294967296.0) {
+				ignoreIntersectionEXT;
+			}
 		}
 	}
 #else
@@ -573,7 +585,13 @@ void main() {
 	float alpha = texture(sampler2D(bindless_textures[nonuniformEXT(mat.albedo_texture_idx)], SAMPLER_LINEAR_WITH_MIPMAPS_REPEAT), uv).a;
 	alpha *= mat.albedo_color.a;
 
-	if (alpha < 0.5) {
+	if ((geom.flags & FLAG_SHADOW_CASTER) != 0u) {
+		// As a custom caster above, by the albedo's alpha.
+		payload.hit_t *= 1.0 - clamp(alpha, 0.0, 1.0);
+		if (payload.hit_t > RT_SHADOW_OPAQUE_TRANSMITTANCE) {
+			ignoreIntersectionEXT;
+		}
+	} else if (alpha < 0.5) {
 		ignoreIntersectionEXT;
 	}
 #endif

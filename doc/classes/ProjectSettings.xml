@@ -3276,6 +3276,10 @@
 			Maximum total triangle count ([code]instance_count * triangles_per_surface[/code]) for a [MultiMesh] surface to use a single merged BLAS in the path tracer. When the combined triangle count exceeds this value, the path tracer falls back to one TLAS entry per instance sharing a common BLAS instead. Lower this value to reduce peak GPU memory for large MultiMeshes; raise it to prefer the merged path (which avoids per-instance TLAS overhead).
 			[b]Note:[/b] Requires a restart to take effect.
 		</member>
+		<member name="rendering/pathtracing/shadow_caster_layers" type="int" setter="" getter="" default="0">
+			Render layers whose shadow-only instances ([constant GeometryInstance3D.SHADOW_CASTING_SETTING_SHADOWS_ONLY]) the path tracer traces as shadow casters. Other shadow-only instances are left out of the traced scene. A caster is met only by shadow rays, never by camera or bounce rays, so it changes none of the guides the denoiser reads. Its alpha dims the light through it by [code]1 - alpha[/code] (or by a shader's alpha scissor, if it sets one), so a soft alpha casts a soft shadow without noise.
+			[b]Note:[/b] Casters are ignored when [member rendering/pathtracing/use_simple_shadows] is [code]true[/code].
+		</member>
 		<member name="rendering/pathtracing/use_shader_execution_reordering" type="bool" setter="" getter="" default="true">
 			If [code]true[/code], enables NVIDIA Shader Execution Reordering in the path tracer. SET reorders ray tracing shader invocations at runtime to improve GPU occupancy and reduce divergence between threads executing different materials. This can significantly improve path tracing performance on NVIDIA Ada Lovelace and later GPUs. Has no effect on hardware that does not support SET.
 		</member>
