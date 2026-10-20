@@ -90,6 +90,7 @@ void StreamlineContext::load_functions(bool d3d12) {
 	this->slFreeResources = SL_GETPROC(PFun_slFreeResources, "slFreeResources");
 	this->slEvaluateFeature = SL_GETPROC(PFun_slEvaluateFeature, "slEvaluateFeature");
 	this->slSetTag = SL_GETPROC(PFun_slSetTag, "slSetTag");
+	this->slSetTagForFrame = SL_GETPROC(PFun_slSetTagForFrame, "slSetTagForFrame");
 	this->slSetConstants = SL_GETPROC(PFun_slSetConstants, "slSetConstants");
 #undef SL_GETPROC
 
@@ -178,6 +179,7 @@ void StreamlineContext::dlssg_disable() {
 	STREAMLINE_GAME_ONLY; // Disable DLSS-G for editor or project settings.
 
 	dlssg_delay = 10;
+	dlssg_last_status = 0;
 
 	if (slDLSSGSetOptions && (uint32_t)dlssg_viewport != UINT_MAX) {
 		WARN_PRINT("Force disabling DLSS-G on viewport: " + itos((unsigned int)StreamlineContext::get().dlssg_viewport));
@@ -197,6 +199,57 @@ void StreamlineContext::reflex_set_options(const sl::ReflexOptions &opts) {
 	reflex_options_dirty = false;
 	sl::Result result = this->slReflexSetOptions ? this->slReflexSetOptions(opts) : sl::Result::eOk;
 	ERR_FAIL_COND_MSG(result != sl::Result::eOk, StreamlineContext::result_to_string(result));
+}
+
+static sl::ReflexMode _reflex_effective_mode(sl::ReflexMode p_requested, bool p_required_by_dlssg) {
+	return (p_required_by_dlssg && p_requested == sl::ReflexMode::eOff) ? sl::ReflexMode::eLowLatency : p_requested;
+}
+
+void StreamlineContext::reflex_request_mode(sl::ReflexMode p_mode) {
+	reflex_requested_mode = p_mode;
+	sl::ReflexMode effective = _reflex_effective_mode(reflex_requested_mode, reflex_required_by_dlssg);
+	if (reflex_options.mode != effective) {
+		reflex_options.mode = effective;
+		reflex_options_dirty = true;
+	}
+}
+
+void StreamlineContext::reflex_set_required_by_dlssg(bool p_required) {
+	if (reflex_required_by_dlssg == p_required) {
+		return;
+	}
+	reflex_required_by_dlssg = p_required;
+	sl::ReflexMode effective = _reflex_effective_mode(reflex_requested_mode, reflex_required_by_dlssg);
+	if (reflex_options.mode != effective) {
+		reflex_options.mode = effective;
+		// Applied on the main thread before the next message loop; this may run on the render thread.
+		reflex_options_dirty = true;
+	}
+}
+
+sl::Result StreamlineContext::set_tags(const sl::ViewportHandle &p_viewport, const sl::ResourceTag *p_tags, uint32_t p_count, sl::CommandBuffer *p_cmd) {
+	if (slSetTagForFrame != nullptr && last_token != nullptr) {
+		return slSetTagForFrame(*last_token, p_viewport, p_tags, p_count, p_cmd);
+	}
+	return slSetTag ? slSetTag(p_viewport, p_tags, p_count, p_cmd) : sl::Result::eErrorMissingInputParameter;
+}
+
+void StreamlineContext::dlssg_report_status(const sl::ViewportHandle &p_viewport) {
+	if (slDLSSGGetState == nullptr) {
+		return;
+	}
+	sl::DLSSGState state{};
+	if (slDLSSGGetState(p_viewport, state, nullptr) != sl::Result::eOk) {
+		return;
+	}
+	uint32_t status = (uint32_t)state.status;
+	if (status == dlssg_last_status) {
+		return;
+	}
+	dlssg_last_status = status;
+	if (status != (uint32_t)sl::DLSSGStatus::eOk) {
+		ERR_PRINT(vformat("DLSS Frame Generation status %d: 1 output too small (min %d px), 2 Reflex not running, 4 back buffer format, 8 invalid constants.", status, state.minWidthOrHeight));
+	}
 }
 
 void StreamlineContext::pcl_set_options(const sl::PCLOptions &opts) {
@@ -364,7 +417,7 @@ void StreamlineContext::initialize(bool d3d12) {
 	pref.renderAPI = d3d12 ? sl::RenderAPI::eD3D12 : sl::RenderAPI::eVulkan;
 	pref.applicationId = 0x90d07004;
 	// Bundled plugins only: OTA plugins can mismatch the interposer.
-	pref.flags = sl::PreferenceFlags::eDisableCLStateTracking;
+	pref.flags = sl::PreferenceFlags::eDisableCLStateTracking | sl::PreferenceFlags::eUseFrameBasedResourceTagging;
 
 	if (bool(GLOBAL_GET("rendering/streamline/streamline_log"))) {
 		pref.logLevel = sl::LogLevel::eVerbose;

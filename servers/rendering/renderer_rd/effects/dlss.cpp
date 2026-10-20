@@ -38,6 +38,8 @@
 #include "drivers/streamline/streamline_context.h"
 #include "servers/rendering/renderer_rd/storage_rd/material_storage.h"
 #include "servers/rendering/renderer_rd/uniform_set_cache_rd.h"
+
+#include <cstdio>
 #endif
 
 using namespace RendererRD;
@@ -191,6 +193,12 @@ DLSSContext *DLSSEffect::create_context(Size2i p_internal_size, Size2i p_target_
 	return context;
 }
 
+// Vulkan or DXGI errors on frame generation's own present thread. It must not block
+// that thread, so it writes a line and returns.
+static void _dlssg_api_error(const sl::APIError &p_error) {
+	fprintf(stderr, "[dlssg] present thread API error %d\n", (int)p_error.vkRes);
+}
+
 static sl::float4x4 sl_make_identity_matrix() {
 	sl::float4x4 ret;
 	ret.setRow(0, sl::float4(1.0f, 0.0f, 0.0f, 0.0f));
@@ -302,7 +310,11 @@ void DLSSEffect::upscale(const DLSSContext::Parameters &p_params) {
 	}
 	// res[1] is the output, which DLSS writes. Declared as sampled, the render graph would not order later reads of it (the tonemap) after this callback.
 	res[1].usage = RD::CALLBACK_RESOURCE_USAGE_STORAGE_IMAGE_READ_WRITE;
-	RD::get_singleton()->driver_callback_add((RDD::DriverCallback)DLSSEffect::_upscale_internal_graph_callback, p_params.context, VectorView<RD::CallbackResource>(res, num_resources));
+	// Under frame generation the callback runs after all the frame's work recorded before it. Ordered
+	// by its resources alone it can be scheduled ahead of work it does not read, and frame generation
+	// then presented no generated frame, status Ok (2026-10-20: a GPU timestamp before the upscale,
+	// which orders the graph the same way, was enough to make it present them).
+	RD::get_singleton()->driver_callback_add((RDD::DriverCallback)DLSSEffect::_upscale_internal_graph_callback, p_params.context, VectorView<RD::CallbackResource>(res, num_resources), p_params.dlss_g);
 }
 
 void DLSSEffect::_upscale_internal(RDD::CommandBufferID cmdid, const DLSSContext::Parameters &p_params) {
@@ -484,7 +496,7 @@ void DLSSEffect::_upscale_internal(RDD::CommandBufferID cmdid, const DLSSContext
 			assignResource(resources, resourceTags, numResources, p_params.dlss_rr_specular_hit_dist, sl::kBufferTypeSpecularHitDistance, sl::ResourceLifecycle::eValidUntilPresent);
 		}
 
-		sl::Result result = StreamlineContext::get().slSetTag(context->viewport, resourceTags, numResources, nativeCmdlist);
+		sl::Result result = StreamlineContext::get().set_tags(context->viewport, resourceTags, numResources, nativeCmdlist);
 		if (result != sl::Result::eOk) {
 			ERR_FAIL_MSG("Failed to call streamline slSetTag. Result: " + String(StreamlineContext::result_to_string(result)));
 		}
@@ -496,6 +508,15 @@ void DLSSEffect::_upscale_internal(RDD::CommandBufferID cmdid, const DLSSContext
 		bool wantActivateDLSSG = p_params.dlss_g;
 		bool canActivateDLSSG = StreamlineContext::get().dlssg_delay == 0;
 
+		// Frame generation presents nothing generated without Reflex running (and PCL's markers,
+		// which Reflex reads): Reflex is held at low latency at least while it is wanted, and frame
+		// generation starts only once those options are applied.
+		if (wantActivateDLSSG && !(StreamlineContext::get().streamline_capabilities.reflex_available && StreamlineContext::get().streamline_capabilities.pcl_available)) {
+			WARN_PRINT_ONCE("DLSS Frame Generation needs Reflex, which is not available: frame generation stays off.");
+			wantActivateDLSSG = false;
+		}
+		StreamlineContext::get().reflex_set_required_by_dlssg(wantActivateDLSSG);
+
 		// Disable previous DLSS-G context if needed
 		if (StreamlineContext::get().dlssg_viewport != sl::ViewportHandle(-1) && ((!wantActivateDLSSG && StreamlineContext::get().dlssg_viewport == context->viewport) || (wantActivateDLSSG && StreamlineContext::get().dlssg_viewport != context->viewport))) {
 			WARN_PRINT("Disabling DLSS-G on viewport: " + itos((unsigned int)StreamlineContext::get().dlssg_viewport));
@@ -506,19 +527,28 @@ void DLSSEffect::_upscale_internal(RDD::CommandBufferID cmdid, const DLSSContext
 			}
 
 			StreamlineContext::get().dlssg_viewport = sl::ViewportHandle(-1);
+			StreamlineContext::get().dlssg_last_status = 0;
 		}
+
+		canActivateDLSSG = canActivateDLSSG && StreamlineContext::get().reflex_running();
 
 		// Enable new DLSS-G context if needed
 		if (canActivateDLSSG && wantActivateDLSSG && StreamlineContext::get().dlssg_viewport != context->viewport) {
 			WARN_PRINT("Enabling DLSS-G on viewport: " + itos((unsigned int)context->viewport));
 
 			dlssGOptions.mode = sl::DLSSGMode::eOn;
+			dlssGOptions.numFramesToGenerate = 1;
+			dlssGOptions.onErrorCallback = _dlssg_api_error;
 			sl::Result result = StreamlineContext::get().slDLSSGSetOptions(context->viewport, dlssGOptions);
 			if (result != sl::Result::eOk) {
 				ERR_FAIL_MSG("Failed to call streamline slDLSSGSetOptions. Result: " + String(StreamlineContext::result_to_string(result)));
 			}
 
 			StreamlineContext::get().dlssg_viewport = context->viewport;
+		}
+
+		if (StreamlineContext::get().dlssg_viewport == context->viewport) {
+			StreamlineContext::get().dlssg_report_status(context->viewport);
 		}
 	}
 
@@ -561,7 +591,7 @@ void DLSSEffect::_upscale_internal(RDD::CommandBufferID cmdid, const DLSSContext
 			assignResource(resources, resourceTags, numResources, p_params.output, sl::kBufferTypeScalingInputColor, sl::ResourceLifecycle::eOnlyValidNow);
 			assignResource(resources, resourceTags, numResources, p_params.output, sl::kBufferTypeScalingOutputColor, sl::ResourceLifecycle::eValidUntilPresent);
 
-			sl::Result result = StreamlineContext::get().slSetTag(context->viewport, resourceTags, numResources, nativeCmdlist);
+			sl::Result result = StreamlineContext::get().set_tags(context->viewport, resourceTags, numResources, nativeCmdlist);
 			if (result != sl::Result::eOk) {
 				ERR_FAIL_MSG("Failed to call streamline slSetTag for NIS. Result: " + String(StreamlineContext::result_to_string(result)));
 			}

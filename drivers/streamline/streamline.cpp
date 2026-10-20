@@ -157,7 +157,8 @@ void Streamline::emit_marker(StreamlineMarkerType marker) {
 			}
 
 			sl_context.get_new_frame_token();
-			if (sl_context.reflex_options.mode != sl::ReflexMode::eOff || sl_context.reflex_options.frameLimitUs > 0) {
+			// Frame generation needs Reflex's sleep every frame it runs.
+			if (sl_context.reflex_options.mode != sl::ReflexMode::eOff || sl_context.reflex_options.frameLimitUs > 0 || sl_context.dlssg_active()) {
 				sl_context.reflex_sleep(sl_context.last_token);
 			}
 			break;
@@ -206,10 +207,7 @@ void Streamline::set_parameter(StreamlineParameterType p_parameter_type, const V
 				newMode = sl::ReflexMode::eOff;
 			}
 
-			if (StreamlineContext::get().reflex_options.mode != newMode) {
-				StreamlineContext::get().reflex_options_dirty = true;
-			}
-			StreamlineContext::get().reflex_options.mode = newMode;
+			StreamlineContext::get().reflex_request_mode(newMode);
 			break;
 		}
 		case StreamlineParameterType::STREAMLINE_PARAM_REFLEX_FRAME_LIMIT_US: {

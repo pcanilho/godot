@@ -46,6 +46,7 @@ public:
 	PFun_slFreeResources *slFreeResources = nullptr;
 	PFun_slEvaluateFeature *slEvaluateFeature = nullptr;
 	PFun_slSetTag *slSetTag = nullptr;
+	PFun_slSetTagForFrame *slSetTagForFrame = nullptr;
 	PFun_slSetConstants *slSetConstants = nullptr;
 	PFun_slSetFeatureLoaded *slSetFeatureLoaded = nullptr;
 	PFun_slSetD3DDevice *slSetD3DDevice = nullptr;
@@ -53,6 +54,11 @@ public:
 	// Reflex
 	sl::ReflexOptions reflex_options;
 	bool reflex_options_dirty = true;
+	// The mode asked for (project setting, Streamline.set_parameter). The mode applied is
+	// low latency at least while frame generation runs: without Reflex it presents nothing
+	// generated (or magenta frames, `eFailReflexNotDetectedAtRuntime`).
+	sl::ReflexMode reflex_requested_mode = sl::ReflexMode::eOff;
+	bool reflex_required_by_dlssg = false;
 	PFun_slReflexGetState *slReflexGetState = nullptr;
 	PFun_slReflexSetOptions *slReflexSetOptions = nullptr;
 	PFun_slReflexSleep *slReflexSleep = nullptr;
@@ -95,6 +101,10 @@ public:
 	static const char *result_to_string(sl::Result result);
 
 	void reflex_set_options(const sl::ReflexOptions &opts);
+	void reflex_request_mode(sl::ReflexMode p_mode);
+	void reflex_set_required_by_dlssg(bool p_required);
+	// Reflex options are applied on the main thread (before the message loop): running once applied.
+	bool reflex_running() const { return reflex_options.mode != sl::ReflexMode::eOff && !reflex_options_dirty; }
 	void reflex_sleep(sl::FrameToken *frameToken);
 	void reflex_get_state(sl::ReflexState &reflexState);
 	void pcl_set_options(const sl::PCLOptions &opts);
@@ -112,6 +122,13 @@ public:
 
 	sl::ViewportHandle dlssg_viewport;
 	int dlssg_delay = 0;
+	bool dlssg_active() const { return (uint32_t)dlssg_viewport != UINT_MAX; }
+	// The last DLSSGStatus seen, so only a change is logged.
+	uint32_t dlssg_last_status = 0;
+	void dlssg_report_status(const sl::ViewportHandle &p_viewport);
+	// Tags for this frame's token: the deprecated slSetTag ties a tag to Streamline's own
+	// frame count, which frame generation, reading the tags at present, may not match.
+	sl::Result set_tags(const sl::ViewportHandle &p_viewport, const sl::ResourceTag *p_tags, uint32_t p_count, sl::CommandBuffer *p_cmd);
 
 #if STREAMLINE_ENABLED_VULKAN
 	StreamlineCapabilities enumerate_support_vulkan(void *vk_physical_device);
