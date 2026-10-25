@@ -32,6 +32,7 @@
 
 #include "servers/rendering/renderer_rd/forward_clustered/render_forward_clustered.h"
 #include "servers/rendering/renderer_rd/forward_clustered/render_raytracing.h"
+#include "servers/rendering/renderer_rd/shaders/effects/rt_fog_filter.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/transparency_composite.glsl.gen.h"
 
 namespace RendererSceneRenderImplementation {
@@ -61,7 +62,17 @@ class RenderForwardClusteredPT : public RenderForwardClustered {
 	} transparency_composite;
 
 	RID _transparency_layer_fb(RenderSceneBuffersRD *p_render_buffers);
-	void _composite_transparency(const RenderDataRD *p_render_data);
+	void _composite_transparency(const RenderDataRD *p_render_data, bool p_fog);
+
+	// The traced volumetric fog's filter: a blur kept to like depths, then an average over
+	// frames into one of two histories, swapped each frame.
+	struct {
+		RtFogFilterShaderRD shader;
+		RID version;
+		RID pipeline;
+	} fog_filter;
+	uint32_t fog_frame = 0;
+	RID _filter_fog(const RenderDataRD *p_render_data);
 
 protected:
 	virtual void _render_scene(RenderDataRD *p_render_data, const Color &p_default_bg_color) override;

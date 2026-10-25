@@ -98,9 +98,22 @@ public:
 	static constexpr int RT_PARAM_SAMPLE_COUNT = 1;
 	static constexpr int RT_PARAM_MAX_BOUNCES = 2;
 	static constexpr int RT_PARAM_DENOISER = 3;
-	// Indices 4-13 reserved for future use.
+	// 4-11: the volumetric fog lit through the traced scene.
+	static constexpr int RT_PARAM_FOG_DENSITY = 4;
+	static constexpr int RT_PARAM_FOG_ALBEDO_R = 5;
+	static constexpr int RT_PARAM_FOG_ALBEDO_G = 6;
+	static constexpr int RT_PARAM_FOG_ALBEDO_B = 7;
+	static constexpr int RT_PARAM_FOG_ANISOTROPY = 8;
+	static constexpr int RT_PARAM_FOG_LENGTH = 9;
+	static constexpr int RT_PARAM_FOG_SKY_AFFECT = 10;
+	static constexpr int RT_PARAM_FOG_SAMPLES = 11;
+	// Indices 12-13 reserved for future use.
 	static constexpr int RT_PARAM_LIGHT_COUNT = 14;
 	static constexpr int RT_PARAM_FRAME_INDEX = 15;
+	static constexpr int RT_PARAM_FOG_AMBIENT_R = 16;
+	static constexpr int RT_PARAM_FOG_AMBIENT_G = 17;
+	static constexpr int RT_PARAM_FOG_AMBIENT_B = 18;
+	static constexpr int RT_PARAM_COUNT = 20;
 
 	static inline uint32_t rt_flags_pack(uint32_t p_flags, uint32_t p_sample_count, uint32_t p_max_bounces) {
 		uint32_t result = p_flags;

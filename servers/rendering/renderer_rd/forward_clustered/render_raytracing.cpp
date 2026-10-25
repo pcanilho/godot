@@ -180,6 +180,25 @@ void RenderRaytracing::rt_ensure_textures(RenderSceneBuffersRD *p_render_buffers
 	if (!p_render_buffers->has_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_RT_DEPTH)) {
 		p_render_buffers->create_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_RT_DEPTH, RD::DATA_FORMAT_R32_SFLOAT, usage_bits, RD::TEXTURE_SAMPLES_1);
 	}
+	if (!p_render_buffers->has_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_RT_FOG)) {
+		p_render_buffers->create_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_RT_FOG, RD::DATA_FORMAT_R16G16B16A16_SFLOAT, usage_bits, RD::TEXTURE_SAMPLES_1);
+	}
+}
+
+RID RenderRaytracing::rt_get_fog_texture(RenderSceneBuffersRD *p_render_buffers) const {
+	ERR_FAIL_NULL_V(p_render_buffers, RID());
+	return p_render_buffers->get_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_RT_FOG);
+}
+
+bool RenderRaytracing::rt_fog_active(const RenderDataRD *p_render_data) const {
+	if (!p_render_data || p_render_data->environment.is_null()) {
+		return false;
+	}
+	RendererEnvironmentStorage *env_storage = RendererEnvironmentStorage::get_singleton();
+	RID env = p_render_data->environment;
+	return env_storage->environment_get_volumetric_fog_enabled(env) && env_storage->environment_get_volumetric_fog_density(env) > 0.0f &&
+			(int)env_storage->environment_get_pathtracing_denoiser(env) == 1 &&
+			GLOBAL_GET_CACHED(int, "rendering/pathtracing/volumetric_fog_samples") > 0;
 }
 
 bool RenderRaytracing::rt_has_texture(RenderSceneBuffersRD *p_render_buffers) const {
@@ -3017,6 +3036,8 @@ uint32_t RenderRaytracing::gather_lights(const RenderDataRD *p_render_data, RT_L
 		ld.indirect_energy = ls->light_get_param(base, RSE::LIGHT_PARAM_INDIRECT_ENERGY);
 		ld.inv_spot_attenuation = 0.0f;
 		ld.cos_spot_angle = 0.0f;
+		// The traced volumetric fog's share of this light, in the padding float.
+		ld._pad0 = ls->light_get_param(base, RSE::LIGHT_PARAM_VOLUMETRIC_FOG_ENERGY);
 		ld.spot_direction[0] = 0.0f;
 		ld.spot_direction[1] = 0.0f;
 		ld.spot_direction[2] = 0.0f;
@@ -3196,11 +3217,11 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 	{
 		struct {
 			//TODO: I see no reason why we need to pass this as a float array
-			float params[16];
+			float params[SceneShaderRaytracing::RT_PARAM_COUNT];
 			float prev_vp_unjittered[16];
 			float curr_vp_unjittered[16];
 		} rt_ubo = {};
-		static_assert(sizeof(rt_ubo) == 48 * sizeof(float));
+		static_assert(sizeof(rt_ubo) == 52 * sizeof(float));
 
 		if (p_render_data && p_render_data->environment.is_valid()) {
 			RendererEnvironmentStorage *env_storage = RendererEnvironmentStorage::get_singleton();
@@ -3209,6 +3230,24 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 			rt_ubo.params[SceneShaderRaytracing::RT_PARAM_SAMPLE_COUNT] = (float)env_storage->environment_get_pathtracing_samples_per_pixel(env);
 			rt_ubo.params[SceneShaderRaytracing::RT_PARAM_MAX_BOUNCES] = (float)env_storage->environment_get_pathtracing_max_bounces(env);
 			rt_ubo.params[SceneShaderRaytracing::RT_PARAM_DENOISER] = (float)(int)env_storage->environment_get_pathtracing_denoiser(env);
+			if (rt_fog_active(p_render_data)) {
+				Color albedo = env_storage->environment_get_volumetric_fog_scattering(env).srgb_to_linear();
+				rt_ubo.params[SceneShaderRaytracing::RT_PARAM_FOG_DENSITY] = env_storage->environment_get_volumetric_fog_density(env);
+				rt_ubo.params[SceneShaderRaytracing::RT_PARAM_FOG_ALBEDO_R] = albedo.r;
+				rt_ubo.params[SceneShaderRaytracing::RT_PARAM_FOG_ALBEDO_G] = albedo.g;
+				rt_ubo.params[SceneShaderRaytracing::RT_PARAM_FOG_ALBEDO_B] = albedo.b;
+				rt_ubo.params[SceneShaderRaytracing::RT_PARAM_FOG_ANISOTROPY] = env_storage->environment_get_volumetric_fog_anisotropy(env);
+				rt_ubo.params[SceneShaderRaytracing::RT_PARAM_FOG_LENGTH] = env_storage->environment_get_volumetric_fog_length(env);
+				rt_ubo.params[SceneShaderRaytracing::RT_PARAM_FOG_SKY_AFFECT] = env_storage->environment_get_volumetric_fog_sky_affect(env);
+				rt_ubo.params[SceneShaderRaytracing::RT_PARAM_FOG_SAMPLES] = (float)GLOBAL_GET_CACHED(int, "rendering/pathtracing/volumetric_fog_samples");
+				// As raster's fog: the ambient light by the ambient inject, and the fog's own emission.
+				Color ambient = env_storage->environment_get_ambient_light(env).srgb_to_linear() * env_storage->environment_get_ambient_light_energy(env) *
+						env_storage->environment_get_volumetric_fog_ambient_inject(env);
+				Color emission = env_storage->environment_get_volumetric_fog_emission(env).srgb_to_linear() * env_storage->environment_get_volumetric_fog_emission_energy(env);
+				rt_ubo.params[SceneShaderRaytracing::RT_PARAM_FOG_AMBIENT_R] = ambient.r + emission.r;
+				rt_ubo.params[SceneShaderRaytracing::RT_PARAM_FOG_AMBIENT_G] = ambient.g + emission.g;
+				rt_ubo.params[SceneShaderRaytracing::RT_PARAM_FOG_AMBIENT_B] = ambient.b + emission.b;
+			}
 		}
 
 		// rt_params layout (see RaytracingParamIndex enum):
@@ -3371,6 +3410,15 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 		u.binding = 15;
 		u.uniform_type = RD::UNIFORM_TYPE_IMAGE;
 		u.append_id(rt_get_depth_texture(rb));
+		uniforms.push_back(u);
+	}
+
+	// Binding 29: the volumetric fog's in-scatter and transmittance (raygen, sample 0).
+	{
+		RD::Uniform u;
+		u.binding = 29;
+		u.uniform_type = RD::UNIFORM_TYPE_IMAGE;
+		u.append_id(rt_get_fog_texture(rb));
 		uniforms.push_back(u);
 	}
 

@@ -440,8 +440,11 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 	// input. Effects before the transparent pass lie under the transparents.
 	const bool layer_effects = _has_compositor_effect(RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_PRE_TRANSPARENT, p_render_data) ||
 			_has_compositor_effect(RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_POST_TRANSPARENT, p_render_data);
+	// The traced fog is laid over Ray Reconstruction's output by the same composite, so it
+	// makes the layer too.
+	const bool fog = raytracing && raytracing->rt_fog_active(p_render_data);
 	const bool transparency_layer = raytracing && raytracing->dlss_rr_has_buffers(rb.ptr()) && scale_type == SCALE_3D_DLSS && !use_msaa &&
-			rb->get_view_count() == 1 && (!render_list[RENDER_LIST_ALPHA].elements.is_empty() || layer_effects) && transparency_composite.pipeline.is_valid() &&
+			rb->get_view_count() == 1 && (!render_list[RENDER_LIST_ALPHA].elements.is_empty() || layer_effects || fog) && transparency_composite.pipeline.is_valid() &&
 			RD::get_singleton()->texture_get_format(rb->get_upscaled_texture()).format == RD::DATA_FORMAT_R16G16B16A16_SFLOAT;
 	if (transparency_layer) {
 		Vector<Color> layer_clear;
@@ -515,7 +518,7 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 		}
 		_render_3d_upscaling(p_render_data, scale_type, using_taa, time_step, dlss_rr_guides);
 		if (transparency_layer) {
-			_composite_transparency(p_render_data);
+			_composite_transparency(p_render_data, fog);
 		}
 	}
 
@@ -647,8 +650,76 @@ RID RenderForwardClusteredPT::_transparency_layer_fb(RenderSceneBuffersRD *p_ren
 	return FramebufferCacheRD::get_singleton()->get_cache_multiview(1, layer, RID(), RID(), depth);
 }
 
-void RenderForwardClusteredPT::_composite_transparency(const RenderDataRD *p_render_data) {
+RID RenderForwardClusteredPT::_filter_fog(const RenderDataRD *p_render_data) {
 	Ref<RenderSceneBuffersRD> rb = p_render_data->render_buffers;
+	const StringName scope = SNAME("rt_fog_filter");
+	const StringName names[3] = { SNAME("blurred"), SNAME("history_a"), SNAME("history_b") };
+	bool made = false;
+	for (const StringName &n : names) {
+		if (!rb->has_texture(scope, n)) {
+			rb->create_texture(scope, n, RD::DATA_FORMAT_R16G16B16A16_SFLOAT, RD::TEXTURE_USAGE_STORAGE_BIT | RD::TEXTURE_USAGE_SAMPLING_BIT, RD::TEXTURE_SAMPLES_1);
+			made = true;
+		}
+	}
+	RID raw = raytracing->rt_get_fog_texture(rb.ptr());
+	RID depth = raytracing->rt_get_depth_texture(rb.ptr());
+	RID velocity = rb->get_velocity_buffer(false);
+	RID blurred = rb->get_texture(scope, names[0]);
+	fog_frame++;
+	RID history = rb->get_texture(scope, (fog_frame & 1u) ? names[1] : names[2]);
+	RID dest = rb->get_texture(scope, (fog_frame & 1u) ? names[2] : names[1]);
+	Size2i size = rb->get_internal_size();
+
+	RD::get_singleton()->draw_command_begin_label("Filter Traced Fog");
+	RID shader = fog_filter.shader.version_get_shader(fog_filter.version, 0);
+	RID sampler = RendererRD::MaterialStorage::get_singleton()->sampler_rd_get_default(RSE::CANVAS_ITEM_TEXTURE_FILTER_LINEAR, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
+	UniformSetCacheRD *cache = UniformSetCacheRD::get_singleton();
+	struct {
+		int32_t size[2];
+		int32_t mode;
+		int32_t reset;
+		float blend;
+		float pad[3];
+	} push = {};
+	push.size[0] = size.x;
+	push.size[1] = size.y;
+	// about sixteen frames of two points each: a shaft settles in a quarter second at 60
+	push.blend = 1.0f / 16.0f;
+	push.reset = made ? 1 : 0;
+
+	RD::Uniform u_depth(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 1, Vector<RID>({ sampler, depth }));
+	RD::Uniform u_velocity(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 3, Vector<RID>({ sampler, velocity }));
+	RD::Uniform u_hist(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 2, Vector<RID>({ sampler, history }));
+
+	RD::ComputeListID list = RD::get_singleton()->compute_list_begin();
+	RD::get_singleton()->compute_list_bind_compute_pipeline(list, fog_filter.pipeline);
+	{
+		RD::Uniform u_src(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ sampler, raw }));
+		RD::Uniform u_dst(RD::UNIFORM_TYPE_IMAGE, 0, blurred);
+		push.mode = 0;
+		RD::get_singleton()->compute_list_bind_uniform_set(list, cache->get_cache(shader, 0, u_src, u_depth, u_hist, u_velocity), 0);
+		RD::get_singleton()->compute_list_bind_uniform_set(list, cache->get_cache(shader, 1, u_dst), 1);
+		RD::get_singleton()->compute_list_set_push_constant(list, &push, sizeof(push));
+		RD::get_singleton()->compute_list_dispatch_threads(list, size.x, size.y, 1);
+	}
+	RD::get_singleton()->compute_list_add_barrier(list);
+	{
+		RD::Uniform u_src(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ sampler, blurred }));
+		RD::Uniform u_dst(RD::UNIFORM_TYPE_IMAGE, 0, dest);
+		push.mode = 1;
+		RD::get_singleton()->compute_list_bind_uniform_set(list, cache->get_cache(shader, 0, u_src, u_depth, u_hist, u_velocity), 0);
+		RD::get_singleton()->compute_list_bind_uniform_set(list, cache->get_cache(shader, 1, u_dst), 1);
+		RD::get_singleton()->compute_list_set_push_constant(list, &push, sizeof(push));
+		RD::get_singleton()->compute_list_dispatch_threads(list, size.x, size.y, 1);
+	}
+	RD::get_singleton()->compute_list_end();
+	RD::get_singleton()->draw_command_end_label();
+	return dest;
+}
+
+void RenderForwardClusteredPT::_composite_transparency(const RenderDataRD *p_render_data, bool p_fog) {
+	Ref<RenderSceneBuffersRD> rb = p_render_data->render_buffers;
+	RID fog = p_fog ? _filter_fog(p_render_data) : RID();
 	RID layer = rb->get_texture(RB_SCOPE_DLSS_RR, RB_TEX_TRANSPARENCY_LAYER);
 	RID color = rb->get_upscaled_texture();
 	Size2i size = rb->get_target_size();
@@ -657,23 +728,29 @@ void RenderForwardClusteredPT::_composite_transparency(const RenderDataRD *p_ren
 	RID shader = transparency_composite.shader.version_get_shader(transparency_composite.version, 0);
 	RID sampler = RendererRD::MaterialStorage::get_singleton()->sampler_rd_get_default(RSE::CANVAS_ITEM_TEXTURE_FILTER_LINEAR, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
 	RD::Uniform u_layer(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ sampler, layer }));
+	RD::Uniform u_fog(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 1, Vector<RID>({ sampler, fog.is_valid() ? fog : layer }));
+	RID nearest = RendererRD::MaterialStorage::get_singleton()->sampler_rd_get_default(RSE::CANVAS_ITEM_TEXTURE_FILTER_NEAREST, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
+	RD::Uniform u_depth(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 2, Vector<RID>({ nearest, fog.is_valid() ? raytracing->rt_get_depth_texture(rb.ptr()) : layer }));
 	RD::Uniform u_color(RD::UNIFORM_TYPE_IMAGE, 0, color);
 	UniformSetCacheRD *uniform_set_cache = UniformSetCacheRD::get_singleton();
 
 	struct {
 		int32_t size[2];
 		float jitter_uv[2];
-	} push;
+		int32_t fog;
+		int32_t pad0;
+	} push = {};
 	push.size[0] = size.x;
 	push.size[1] = size.y;
 	// The jitter is added to the projection after its y flip (`RenderSceneDataRD`),
 	// so the layer's content sits half of it over in UV.
 	push.jitter_uv[0] = p_render_data->scene_data->taa_jitter.x * 0.5f;
 	push.jitter_uv[1] = p_render_data->scene_data->taa_jitter.y * 0.5f;
+	push.fog = fog.is_valid() ? 1 : 0;
 
 	RD::ComputeListID compute_list = RD::get_singleton()->compute_list_begin();
 	RD::get_singleton()->compute_list_bind_compute_pipeline(compute_list, transparency_composite.pipeline);
-	RD::get_singleton()->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader, 0, u_layer), 0);
+	RD::get_singleton()->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader, 0, u_layer, u_fog, u_depth), 0);
 	RD::get_singleton()->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader, 1, u_color), 1);
 	RD::get_singleton()->compute_list_set_push_constant(compute_list, &push, sizeof(push));
 	RD::get_singleton()->compute_list_dispatch_threads(compute_list, size.x, size.y, 1);
@@ -687,10 +764,14 @@ RenderForwardClusteredPT::RenderForwardClusteredPT() {
 	transparency_composite.shader.initialize(modes, "");
 	transparency_composite.version = transparency_composite.shader.version_create();
 	transparency_composite.pipeline = RD::get_singleton()->compute_pipeline_create(transparency_composite.shader.version_get_shader(transparency_composite.version, 0));
+	fog_filter.shader.initialize(modes, "");
+	fog_filter.version = fog_filter.shader.version_create();
+	fog_filter.pipeline = RD::get_singleton()->compute_pipeline_create(fog_filter.shader.version_get_shader(fog_filter.version, 0));
 }
 
 RenderForwardClusteredPT::~RenderForwardClusteredPT() {
 	transparency_composite.shader.version_free(transparency_composite.version);
+	fog_filter.shader.version_free(fog_filter.version);
 	if (raytracing) {
 		memdelete(raytracing);
 	}

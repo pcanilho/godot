@@ -43,6 +43,7 @@
 
 #define RB_TEX_RAYTRACING SNAME("raytracing")
 #define RB_TEX_RT_DEPTH SNAME("rt_depth")
+#define RB_TEX_RT_FOG SNAME("rt_fog")
 
 #define RB_SCOPE_DLSS_RR SNAME("dlss_rr")
 #define RB_TEX_DLSS_RR_DIFFUSE_ALBEDO SNAME("diffuse_albedo")
@@ -510,6 +511,10 @@ public:
 	RID rt_get_texture(RenderSceneBuffersRD *p_render_buffers) const;
 	bool rt_has_depth_texture(RenderSceneBuffersRD *p_render_buffers) const;
 	RID rt_get_depth_texture(RenderSceneBuffersRD *p_render_buffers) const;
+	// The fog's in-scatter (rgb) and transmittance to the primary hit (a), at the internal size.
+	RID rt_get_fog_texture(RenderSceneBuffersRD *p_render_buffers) const;
+	// Whether this frame traces the volumetric fog: the environment's, under Ray Reconstruction.
+	bool rt_fog_active(const RenderDataRD *p_render_data) const;
 
 	// DLSS Ray Reconstruction guide buffers (stored on the render buffers).
 	void dlss_rr_ensure_buffers(RenderSceneBuffersRD *p_render_buffers);

@@ -13,15 +13,29 @@
 // ============================================================================
 // RT_PARAMS INDICES - Must match RT_PARAM_* in scene_shader_raytracing.h
 // ============================================================================
-// rt_params is a vec4[4] uniform buffer (16 floats total)
+// rt_params is a vec4[5] uniform buffer (20 floats total)
 // Access: rt_params[idx >> 2][idx & 3] or get_rt_param(idx)
 #define RT_PARAM_VIS_MODE 0 // rt_params[0].x - Debug visualization mode (0 = disabled)
 #define RT_PARAM_SAMPLE_COUNT 1 // rt_params[0].y - Samples per pixel
 #define RT_PARAM_MAX_BOUNCES 2 // rt_params[0].z - Maximum ray bounces
 #define RT_PARAM_DENOISER 3 // rt_params[0].w - Denoiser selection (0=none, 1=DLSS RR)
-// Indices 4-13 reserved for future use
+// 4-11: the volumetric fog the sun lights through the traced scene (sun shafts)
+#define RT_PARAM_FOG_DENSITY 4 // extinction per metre
+#define RT_PARAM_FOG_ALBEDO_R 5
+#define RT_PARAM_FOG_ALBEDO_G 6
+#define RT_PARAM_FOG_ALBEDO_B 7
+#define RT_PARAM_FOG_ANISOTROPY 8 // Henyey-Greenstein g
+#define RT_PARAM_FOG_LENGTH 9 // metres marched, at most
+#define RT_PARAM_FOG_SKY_AFFECT 10
+#define RT_PARAM_FOG_SAMPLES 11 // points (and shadow rays) a pixel; 0 off
+// Indices 12-13 reserved for future use
 #define RT_PARAM_LIGHT_COUNT 14 // rt_params[3].z - Number of active lights in light buffer
 #define RT_PARAM_FRAME_INDEX 15 // rt_params[3].w - Frame counter for temporal variation
+// 16-18: the light the fog takes from the sky and the room (the environment's ambient
+// light times the fog's ambient inject, plus its emission), unshadowed
+#define RT_PARAM_FOG_AMBIENT_R 16
+#define RT_PARAM_FOG_AMBIENT_G 17
+#define RT_PARAM_FOG_AMBIENT_B 18
 
 // ============================================================================
 // PATHTRACING PAYLOAD (32 bytes, fp16/unorm-packed)

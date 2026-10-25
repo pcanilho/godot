@@ -26,6 +26,112 @@ layout(set = 0, binding = 1) uniform accelerationStructureEXT tlas;
 
 layout(location = 0) rayPayloadEXT PathPayload payload;
 
+// The volumetric fog lit through the traced scene (sun shafts): in-scatter in rgb,
+// the transmittance to the primary hit in a. Its own image, filtered and laid over
+// Ray Reconstruction's output; never part of the path's radiance, so RR never sees it.
+layout(set = 0, binding = 29, rgba16f) uniform image2D rt_fog_image;
+
+// As RTLightData (raytracing_lights_inc.glsl), the volumetric fog energy in _pad0.
+struct FogLightData {
+	vec3 position;
+	uint type;
+	vec3 emission;
+	float radius;
+	float attenuation;
+	float inv_max_range;
+	float max_range_squared;
+	float specular_amount;
+	float indirect_energy;
+	float inv_spot_attenuation;
+	float cos_spot_angle;
+	float volumetric_energy;
+	vec3 spot_direction;
+	float _pad1;
+};
+
+layout(set = 0, binding = 13, std430) readonly buffer FogLightBuffer {
+	FogLightData fog_lights[];
+};
+
+// The sun through the scene from a point in the air: 1 clear, 0 blocked, between for
+// a shadow-only caster's alpha (its any-hit keeps the transmittance in hit_t).
+float fog_shadow(vec3 p_origin, vec3 p_dir) {
+	PathState shadow_ps;
+	shadow_ps.radiance = vec3(0.0);
+	shadow_ps.throughput = vec3(0.0);
+	shadow_ps.packed_bounces_flags = set_shadow_ray(0u);
+	shadow_ps.rng_state = 0u;
+	shadow_ps.hit_t = 1.0;
+	shadow_ps.offset_normal = vec3(0.0, 0.0, 1.0);
+	shadow_ps.next_ray_dir = vec3(0.0, 0.0, 1.0);
+	path_pack(payload, shadow_ps);
+#ifdef USE_SER
+	hitObjectEXT hitObject;
+	hitObjectTraceRayEXT(hitObject, tlas, gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
+			RT_MASK_SHADOW, 0, 0, 0, p_origin, 0.001, p_dir, 10000.0, 0);
+	bool visible = !hitObjectIsHitEXT(hitObject);
+#else
+	traceRayEXT(tlas, gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
+			RT_MASK_SHADOW, 0, 0, 0, p_origin, 0.001, p_dir, 10000.0, 0);
+	bool visible = path_unpack(payload).radiance.x > 0.5;
+#endif
+	return visible ? clamp(payload.hit_t, 0.0, 1.0) : 0.0;
+}
+
+float fog_phase(float p_cos, float p_g) {
+	float g2 = p_g * p_g;
+	return (1.0 - g2) / (4.0 * PI * pow(max(1.0 + g2 - 2.0 * p_g * p_cos, 1e-4), 1.5));
+}
+
+// K points along the primary ray, stratified with a per-pixel, per-frame offset; a
+// shadow ray from each to every directional light that lights the fog.
+vec4 fog_march(vec3 p_origin, vec3 p_dir, float p_primary_t, uint p_samples, inout uint rng) {
+	float density = get_rt_param(RT_PARAM_FOG_DENSITY);
+	float reach = get_rt_param(RT_PARAM_FOG_LENGTH);
+	bool sky = p_primary_t < 0.0;
+	float seg = sky ? reach : min(p_primary_t, reach);
+	float weight = sky ? get_rt_param(RT_PARAM_FOG_SKY_AFFECT) : 1.0;
+	if (seg <= 0.0 || density <= 0.0) {
+		return vec4(0.0, 0.0, 0.0, 1.0);
+	}
+	vec3 albedo = vec3(get_rt_param(RT_PARAM_FOG_ALBEDO_R), get_rt_param(RT_PARAM_FOG_ALBEDO_G), get_rt_param(RT_PARAM_FOG_ALBEDO_B));
+	float g = get_rt_param(RT_PARAM_FOG_ANISOTROPY);
+	uint light_count = uint(get_rt_param(RT_PARAM_LIGHT_COUNT));
+	float dx = seg / float(p_samples);
+	float offset = rand(rng);
+	vec3 scatter = vec3(0.0);
+	[[dont_unroll]] for (uint i = 0u; i < p_samples; i++) {
+		float t = (float(i) + offset) * dx;
+		vec3 x = p_origin + p_dir * t;
+		float transmittance = exp(-density * t);
+		[[dont_unroll]] for (uint li = 0u; li < light_count; li++) {
+			FogLightData light = fog_lights[li];
+			if (light.type != 1u || light.volumetric_energy <= 0.0) {
+				continue;
+			}
+			// a direction in the sun's disc, so the shafts' edges are as soft as the shadows
+			vec3 axis = -normalize(light.position);
+			vec2 u = rand2(rng);
+			float cos_max = cos(light.radius);
+			float cos_t = 1.0 - u.x * (1.0 - cos_max);
+			float sin_t = sqrt(max(0.0, 1.0 - cos_t * cos_t));
+			float phi = 2.0 * PI * u.y;
+			vec3 tangent = normalize(abs(axis.y) < 0.999 ? cross(axis, vec3(0.0, 1.0, 0.0)) : cross(axis, vec3(1.0, 0.0, 0.0)));
+			vec3 bitangent = cross(axis, tangent);
+			vec3 L = normalize(tangent * (sin_t * cos(phi)) + bitangent * (sin_t * sin(phi)) + axis * cos_t);
+			float v = fog_shadow(x, L);
+			scatter += light.emission * light.volumetric_energy * fog_phase(dot(p_dir, L), g) * v * transmittance;
+		}
+	}
+	scatter *= albedo * density * dx * weight;
+	float through = sky ? mix(1.0, exp(-density * seg), weight) : exp(-density * seg);
+	// the sky's and the room's light in the fog, which no shadow ray stops: what it adds
+	// over the segment is that light times the share it takes out, 1 - transmittance
+	vec3 ambient = vec3(get_rt_param(RT_PARAM_FOG_AMBIENT_R), get_rt_param(RT_PARAM_FOG_AMBIENT_G), get_rt_param(RT_PARAM_FOG_AMBIENT_B));
+	scatter += albedo * ambient * (1.0 - through);
+	return vec4(scatter, through);
+}
+
 void main() {
 	uvec2 pixel = gl_LaunchIDEXT.xy;
 	const vec2 pixel_center = vec2(pixel) + vec2(0.5);
@@ -53,6 +159,9 @@ void main() {
 	// TODO: when we have a spp > 0 the first raycast is always identical,
 	// we should move it out of the loop
 
+	// the primary ray's hit distance, sample 0 (-1: the sky)
+	float primary_t = -1.0;
+
 	[[dont_unroll]] for (uint sample_idx = 0u; sample_idx < samples_per_pixel; sample_idx++) {
 		PathState ps;
 		ps.radiance = vec3(0.0);
@@ -64,6 +173,9 @@ void main() {
 		vec3 ray_dir = direction.xyz;
 
 		[[dont_unroll]] for (uint bounce = 0u; bounce <= max_bounces; bounce++) {
+			if (bounce == 0u) {
+				ps.hit_t = -1.0;
+			}
 			path_pack(payload, ps);
 
 #ifdef USE_SER
@@ -84,6 +196,9 @@ void main() {
 #endif
 
 			ps = path_unpack(payload);
+			if (bounce == 0u && sample_idx == 0u) {
+				primary_t = ps.hit_t;
+			}
 			if (is_path_terminated(ps.packed_bounces_flags)) {
 				break;
 			}
@@ -99,6 +214,12 @@ void main() {
 	vec3 final_radiance = total_radiance / float(samples_per_pixel);
 
 	imageStore(image, ivec2(pixel), vec4(final_radiance, 1.0));
+
+	uint fog_samples = uint(get_rt_param(RT_PARAM_FOG_SAMPLES));
+	if (fog_samples > 0u) {
+		uint fog_rng = init_rng(pixel, frame_index, 977u);
+		imageStore(rt_fog_image, ivec2(pixel), fog_march(origin.xyz, normalize(direction.xyz), primary_t, fog_samples, fog_rng));
+	}
 }
 
 #[miss]
